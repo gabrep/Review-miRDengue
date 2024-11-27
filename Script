@@ -1,0 +1,323 @@
+---
+title: "GSE150623"
+output: html_document
+date: "2024-11-26"
+---
+
+#Packages
+```{r}
+library(tidyverse)
+library(GEOquery)
+library(oligo)
+library(affycoretools)
+library(limma)
+library(hugene21sttranscriptcluster.db)
+library(FactoMineR); library(factoextra)
+library(clusterProfiler)
+library(DESeq2)
+library(edgeR)
+library(dendextend)
+library(reshape2)
+library(pheatmap)
+```
+
+#Load data
+```{r}
+id <- "GSE150623"
+
+gse <- getGEO(id)
+gse <- gse[[1]]
+
+pdata <- pData(gse)
+unique(pdata$`subject status/time point:ch1`)
+
+gsm <- pdata %>% filter(!`subject status/time point:ch1` %in% "Day 5 Followup")
+gsm$sample <- sub(".*\\[(.*)\\].*", "\\1", gsm$title)
+
+rnaseq <- getGEOSuppFiles(id)
+rnaseq <- read.delim(file = "GSE150623/GSE150623_total_miRNA_count.txt.gz")
+
+all(gsm$sample %in% colnames(rnaseq))
+all(gsm$sample == colnames(rnaseq))
+
+gsm <- gsm %>% arrange(match(sample, colnames(rnaseq)))
+all(gsm$sample == colnames(rnaseq))
+```
+
+#DGE
+```{r}
+dge <- DGEList(rnaseq)
+dge$samples$group <- gsm$`subject status/time point:ch1`
+dge$genes <- data.frame(mir=sub("_.*", "", rownames(rnaseq)))
+
+
+mean(dge$samples$lib.size) * 1e-6
+median(dge$samples$lib.size) * 1e-6
+
+cpm <- cpm(dge)
+lcpm <- cpm(dge, log=T)
+
+dim(cpm)
+summary(lcpm)
+```
+
+#Low counts filter
+```{r}
+dge$genes
+table(rowSums(dge$counts == 0) == ncol(dge$counts))
+plot(density(lcpm[,1]))
+
+keep.exprs <- filterByExpr(dge, group=dge$samples$group)
+table(keep.exprs)
+dge <- dge[keep.exprs, keep.lib.sizes=F]
+dim(dge)
+
+cpm <- cpm(dge)
+lcpm <- cpm(dge, log=T)
+dim(cpm)
+
+plot(density(lcpm[,1]))
+```
+
+```{r}
+L <- mean(dge$samples$lib.size) * 1e-6
+M <- median(dge$samples$lib.size) * 1e-6
+lcpm.cutoff <- log2(10/M + 2/L)
+
+
+library(RColorBrewer)
+nsamples <- ncol(dge)
+col <- brewer.pal(nsamples, "Paired")
+#par(mfrow=c(1,2))
+plot(density(lcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.25),las=2, main="", xlab="")
+
+title(xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+
+for (i in 2:nsamples){
+  den <- density(lcpm[,i])
+  lines(den$x, den$y, col=col[i], lwd=2)
+}
+```
+
+#Clustering
+```{r}
+dist <- dist(t(lcpm))
+hc <- hclust(dist)
+dend <- as.dendrogram(hc)
+
+
+dend %>% 
+  color_labels(labels= colnames(lcpm[,which(gsm$`subject status/time point:ch1` == "day 0")]), col=col[2]) %>% 
+  color_labels(labels= colnames(lcpm[,which(gsm$`subject status/time point:ch1` == "Dengue Warning Sign")]), col=col[4]) %>% 
+  color_labels(labels= colnames(lcpm[,which(gsm$`subject status/time point:ch1` == "Dengue Severe")]), col=col[6]) %>% 
+  plot()
+
+legend('topright',
+       legend=c("Day 0", "Warning Sign", "Severe"),
+       col=c(col[c(2,4,6)]),
+       pch=c(20,20,20))
+```
+
+```{r}
+pca <- PCA(t(cpm), graph=F)
+
+fviz_pca_ind(pca,
+             mean.point=F,
+             geom.ind = c('point', 'text'), pointshape=21, pointsize=4,
+             fill.ind = dge$samples$group,
+             addEllipses = T, ellipse.type='confidence')
+```
+
+```{r}
+to_remove <- c("sample_B15", "Sample_C9", "Sample_20655")
+which(colnames(dge) %in% to_remove)
+dge.select <- dge[, -c(which(colnames(dge) %in% to_remove))]
+dim(dge.select)
+
+pca <- PCA(t(cpm(dge.select, log=T)), graph=F)
+
+fviz_pca_ind(pca,
+             mean.point=F,
+             geom.ind = c('point', 'text'), pointshape=21, pointsize=4,
+             fill.ind = dge.select$samples$group,
+             addEllipses = T, ellipse.type='confidence')
+```
+
+#Normalization
+```{r}
+dge.select <- calcNormFactors(dge.select, method = "TMM")
+
+cpm <- cpm(dge.select)
+```
+
+#DEG
+```{r}
+design <- model.matrix(~0+dge.select$samples$group)
+colnames(design) <- c("Control", "Severe", "Warning")
+contrasts <- makeContrasts(Severe - Control,
+                           Warning - Control,
+                           Severe - Warning, levels=colnames(design))
+
+v <- voom(dge.select, design = design, plot=T)
+v
+
+vfit <- lmFit(v, design)
+vfit <- (contrasts.fit(vfit, contrasts=contrasts))
+efit <- eBayes(vfit)
+plotSA(efit)
+
+summary(decideTests(efit, p.value = 0.05, lfc = 1.5))
+
+severe_control <- topTable(efit, coef = 1, number = Inf)
+warning_control <- topTable(efit, coef = 2, number = Inf)
+severe_warning <- topTable(efit, coef = 3, number = Inf)
+```
+
+##1) Severe and Warning vs Control
+```{r}
+BioVenn::draw.venn(list_x = filter(severe_control, abs(logFC) >=1.5, adj.P.Val <= 0.05)$mir, xtitle = "Severe vs Control",
+                   list_y = filter(warning_control, abs(logFC) >=1.5, adj.P.Val <= 0.05)$mir, ytitle = "Warning vs Control",
+                   list_z = NULL, x_c="purple", y_c = "coral")
+
+```
+
+```{r}
+#Conferir quais miRs estao diferencialmente na mesma direção em ambas comparações
+severe_control$comparison <- "severe"
+warning_control$comparison <- "warning"
+
+res_vs.control <- rbind(filter(severe_control, abs(logFC) >=1.5, adj.P.Val <= 0.05), 
+                               filter(warning_control, abs(logFC) >=1.5, adj.P.Val <= 0.05))
+
+res_vs.control <- res_vs.control %>% mutate(Reg = ifelse(logFC < 0, "Down", "Up"))
+
+colnames(res_vs.control)
+res_vs.control <- res_vs.control %>% dplyr::select(mir ,logFC, P.Value, adj.P.Val, comparison, Reg)
+vs.control <- res_vs.control
+dim(res_vs.control)
+dim(vs.control)
+res_vs.control <- pivot_wider(res_vs.control, id_cols = mir ,names_from = comparison, values_from = c(logFC, P.Value, adj.P.Val, Reg))
+
+res_vs.control <- res_vs.control[res_vs.control$Reg_severe == res_vs.control$Reg_warning,] %>% na.omit()
+
+#Intersecção entre comparações vs controle
+vs.control <- vs.control %>% filter(mir %in% res_vs.control$mir)
+
+```
+
+###Graficos
+```{r}
+vs.control %>% ggplot(aes(logFC, reorder(mir, dplyr::desc(logFC)), fill=comparison))+
+  geom_segment(aes(x=0, xend=logFC), color='grey20')+
+  geom_point(shape=21, size=4)+
+  geom_vline(xintercept = 0, linetype='dashed', color='grey30')+
+  scale_fill_manual(values=c("purple", "coral"), labels=c("Severe", "Warning Signal"), name="Comparison \nGroup vs Control")+
+  labs(y=NULL)+
+  theme_classic()+
+  theme(axis.text=element_text(size=10, color='black'),
+        legend.position = 'inside',
+        legend.position.inside = c(.65,.8),
+        legend.text = element_text(size=12))
+
+counts.select <- dge.select$counts %>% as.data.frame() %>% rownames_to_column(var="mir") %>% 
+  mutate(mir = sub("_.*", "", .$mir)) %>% 
+  filter(mir %in% vs.control$mir) %>% 
+  column_to_rownames(., var='mir')
+
+
+amostras <- data.frame(sample = colnames(counts.select)) %>% left_join(gsm[,c(42,44)]) %>% dplyr::rename("group"=2) %>% column_to_rownames(., var='sample')
+
+pheatmap(cpm(counts.select, log=T),
+        cluster_rows = T, show_colnames = F, treeheight_row = 0,
+        color=colorRampPalette(brewer.pal(6,"RdBu"))(100),
+        #color = RColorBrewer::brewer.pal(11, "RdBu"),
+        annotation_col = amostras,  annotation_colors = list(group = c("day 0" = 'indianred1',
+                                                                       'Dengue Severe' = "firebrick1",
+                                                                       'Dengue Warning Sign' = "deepskyblue2")),
+        border_color = NA)
+
+
+data.frame(rownames(counts.select)) %>% 
+  write.table(., file='mir.txt', row.names = F, col.names = F)
+```
+
+```{r}
+vs.control %>% ggplot(aes(logFC, reorder(mir, dplyr::desc(logFC)), fill=comparison))+
+  geom_segment(aes(x=0, xend=logFC), color='grey20')+
+  geom_point(shape=21, size=4)+
+  geom_vline(xintercept = 0, linetype='dashed', color='grey30')+
+  scale_fill_manual(values=c("purple", "coral"), labels=c("Severe", "Warning Signal"), name="Comparison \nGroup vs Control")+
+  labs(y=NULL)+
+  theme_classic()+
+  theme(axis.text=element_text(size=10, color='black'),
+  legend.position = 'inside',
+  legend.position.inside = c(.65,.8),
+  legend.text = element_text(size=12))
+#ggsave("Figures/DEMirs-vsControl.pdf", width = 6, height = 6)
+```
+
+
+```{r}
+vsC.reac <- read_csv(file = "miRPath-v4-REACTOME_vsControl.csv")
+vsC.msigdb <- read_csv(file = "miRPath-v4-miRNA-MsigDB_vsControl.csv")
+
+
+vsC.enrich <- rbind(filter(vsC.msigdb, `Term Name` %in% c("HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+                                                          "HALLMARK_TGF_BETA_SIGNALING",
+                                                          "HALLMARK_INFLAMMATORY_RESPONSE",
+                                                          "HALLMARK_PI3K_AKT_MTOR_SIGNALING",
+                                                          "HALLMARK_IL2_STAT5_SIGNALING",
+                                                          "HALLMARK_HYPOXIA")),
+                    filter(vsC.reac, `Term Name` %in% c("Interleukin-4 and Interleukin-13 signaling",
+                                                        "Cytokine Signaling in Immune system",
+                                                        "Generic Transcription Pathway",
+                                                        "Signaling by Interleukins",
+                                                        "Interleukin-10 signaling",
+                                                        "Interleukin-6 signaling")))
+vsC.msigdb$db <- 'msigdb'
+vsC.reac$db <- 'reactome'
+
+
+vsC.enrich <- vsC.enrich %>% separate_rows(c(`miRNA Names`, `P-value separate`), sep=",")
+vsC.enrich$`P-value separate` <- as.numeric(vsC.enrich$`P-value separate`)
+
+vsC.enrich %>% ggplot(aes(x=`miRNA Names`, y=reorder(`Term Name`, dplyr::desc(`Merged FDR`)), fill=-log10(`P-value separate`)))+
+  geom_tile()+
+  theme_classic()+
+  labs(x=NULL, y=NULL, tag="MSigDB Hallmark \nReactome pathways")+
+  scale_fill_gradient(low="tan", high = "firebrick1", name="-log10(FDR)")+
+  ggpubr::rotate_x_text(angle=90)+
+  theme(axis.text.y = element_text(colour = c(rep("steelblue4",6),
+  rep("darkred",6))),
+  axis.text.x = element_text(color='black'),
+  legend.position = "top",
+  plot.tag.position = c(.2, .95))
+ggsave("Figures/Enrichment_vsControl.svg", width = 6, height = 6)
+```
+
+##Severe vs Warning
+```{r}
+#Criar venn para verificar a presença de X) miRs da comparação Severe vs Warning que estão presentes também na comparação Y)Severe vs Control e Z) Warning vs Control;
+  #Dessa forma, idenficamos miRs que estao presentes nos quadros de dengue, mas que se destacam por estarem presentes vs o Controle e contra o contragrupo, podendo se relacionar com a intensidade do quadro
+BioVenn::draw.venn(list_x = filter(severe_warning, abs(logFC) >=1.5, adj.P.Val <= 0.05)$mir, xtitle = "\nSevere vs Warning",
+                   list_y = filter(severe_control, abs(logFC) >=1.5, adj.P.Val <= 0.05)$mir, ytitle = "\n\nSevere vs Control",
+                   list_z = filter(warning_control, abs(logFC) >=1.5, adj.P.Val <= 0.05)$mir, ztitle = "\n\n\n\n\n\nWarning vs Control") #-> venn.swc
+```
+
+```{r}
+pred.venn <- BioVenn::draw.venn(list_x = filter(severe_warning, abs(logFC) >=1.5, adj.P.Val <= 0.05)$mir, xtitle = "\nSevere vs Warning",
+                           list_y = filter(severe_control, abs(logFC) >=1.5, adj.P.Val <= 0.05)$mir, ytitle = "\nSevere vs Control",
+                           list_z = NULL)
+
+prot.venn <- BioVenn::draw.venn(list_x = filter(severe_warning, abs(logFC) >=1.5, adj.P.Val <= 0.05)$mir, xtitle = "\nSevere vs Warning",
+                           list_y = filter(warning_control, abs(logFC) >=1.5, adj.P.Val <= 0.05)$mir, ytitle = "\nWarning vs Control",
+                           list_z = NULL)
+
+pred <- data.frame(mir=pred.venn$xy, fac="pred")
+prot <- data.frame(mir=prot.venn$xy, fac="prot")
+
+sw <- rbind(pred, prot) %>% left_join(severe_warning[,c(1,2)])
+```
+
+
